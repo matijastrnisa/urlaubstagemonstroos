@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime
 import plotly.express as px
+import json
+import re
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -10,14 +12,12 @@ from googleapiclient.discovery import build
 # -----------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------
-
 st.set_page_config(page_title="Urlaubsplaner 2026", layout="wide")
-st.title("🏖 Urlaubsplaner 2026 – Google Sheets API Version")
+st.title("🏖 Urlaubsplaner 2026 – Google Sheets API Version (Secrets)")
 
 st.markdown("""
 Diese App:
-
-- liest **direkt aus Google Sheets** (keine Uploads notwendig)
+- liest direkt aus Google Sheets (API)
 - erkennt Urlaubstage anhand von **„u“** in Zellen
 - zählt alle Urlaubstage im Jahr **2026**
 - zeigt Kontingent, genommene Tage und Resturlaub pro Person
@@ -25,38 +25,38 @@ Diese App:
 
 
 # -----------------------------------------------------------
-# GOOGLE SHEETS API SETUP
+# GOOGLE SHEETS API SETUP (via Streamlit Secrets)
 # -----------------------------------------------------------
-
-# Die JSON-Credentials müssen in deinem GitHub Repo liegen:
-SERVICE_ACCOUNT_FILE = "service_account.json"
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
-credentials = Credentials.from_service_account_file(
-    SERVICE_ACCOUNT_FILE,
-    scopes=SCOPES
-)
+if "GCP_SERVICE_ACCOUNT_JSON" not in st.secrets:
+    st.error("❌ Streamlit Secret 'GCP_SERVICE_ACCOUNT_JSON' fehlt. Manage app → Settings → Secrets.")
+    st.stop()
 
-service = build("sheets", "v4", credentials=credentials)
+try:
+    sa_info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+    credentials = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+except Exception as e:
+    st.error(f"❌ Konnte Service Account JSON nicht laden. Prüfe Secrets-Format. Details: {e}")
+    st.stop()
+
+service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
 
 # -----------------------------------------------------------
-# GOOGLE SHEET EINSTELLUNGEN
+# SHEET SETTINGS
 # -----------------------------------------------------------
-
 SPREADSHEET_ID = "1Bm1kGFe_Pokr0zNiP8IBW-is2vDlGbf1oCvxZQEQhQs"
-RANGE = "Sheet1"   # Wenn dein Sheet anders heißt → anpassen
+
+st.subheader("0️⃣ Sheet-Einstellungen")
+sheet_name = st.text_input("Sheet Tab Name (z.B. 'Sheet1')", value="Sheet1")
+RANGE = f"{sheet_name}"
 
 
 # -----------------------------------------------------------
 # HILFSFUNKTIONEN
 # -----------------------------------------------------------
-
 def extract_dates_row(values):
-    """
-    Findet die Zeile mit den meisten Datumswerten.
-    Liefert: (row_index, dict{col_index -> date})
-    """
     best_idx = None
     best_count = -1
     best_map = {}
@@ -64,18 +64,15 @@ def extract_dates_row(values):
     for i, row in enumerate(values):
         count = 0
         date_map = {}
-        for j, cell in enumerate(row[1:], start=1):  # Spalte 0 = Name
+        for j, cell in enumerate(row[1:], start=1):  # col0 = name
             d = None
             if isinstance(cell, str):
                 for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
                     try:
                         d = datetime.strptime(cell.strip(), fmt).date()
                         break
-                    except:
+                    except Exception:
                         pass
-            elif isinstance(cell, datetime):
-                d = cell.date()
-
             if d is not None:
                 count += 1
                 date_map[j] = d
@@ -89,24 +86,18 @@ def extract_dates_row(values):
 
 
 def normalize_name(s):
-    """
-    Entfernt ':' und Groß/Kleinschreibung.
-    Beispiel: "Mareike:" → "mareike"
-    """
     return s.split(":")[0].strip().lower()
 
 
 # -----------------------------------------------------------
-# PERSONEN & URLAUBSKONTINGENT
+# PERSONEN & KONTINGENT
 # -----------------------------------------------------------
-
 st.subheader("1️⃣ Personen & Kontingent")
 
 personen_input = st.text_input(
     "Mitarbeitende (Komma-getrennt)",
     "Sonja, Mareike, Sophia, Ruta, Xenia, Anna"
 )
-
 personen = [p.strip() for p in personen_input.split(",") if p.strip()]
 personen_norm = [normalize_name(p) for p in personen]
 
@@ -115,57 +106,44 @@ default_kontingent = st.number_input(
     min_value=1, max_value=60, value=30
 )
 
-
-# -----------------------------------------------------------
-# AUSWERTUNG STARTEN
-# -----------------------------------------------------------
-
 st.subheader("2️⃣ Auswertung starten")
 
 if st.button("🚀 Urlaub 2026 auswerten"):
-
     try:
-        # SHEET LADEN
         sheet = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=RANGE
         ).execute()
 
         values = sheet.get("values", [])
-
         if not values:
-            st.error("Keine Daten im Google Sheet gefunden.")
+            st.error("Keine Daten im Sheet gefunden. Prüfe Tab-Name.")
             st.stop()
 
-        # DATUMSZEILE FINDEN
         date_row_idx, date_map = extract_dates_row(values)
-
         if date_row_idx is None or len(date_map) == 0:
-            st.error("Konnte keine Datumszeile finden.")
+            st.error("Konnte keine Datumszeile erkennen. (Sind Datumswerte als Text vorhanden?)")
             st.stop()
 
-        st.success(f"Datumszeile erkannt: Zeile {date_row_idx + 1} im Sheet.")
+        st.success(f"Datumszeile erkannt (0-basiert): {date_row_idx}")
 
-        # PERSONENZEILEN FINDEN
+        # Personenzeilen finden
         person_rows = {}
         for i, row in enumerate(values):
-            if len(row) == 0:
+            if not row:
                 continue
-            cell = row[0]
-            if isinstance(cell, str):
-                nm = normalize_name(cell)
+            cell0 = row[0]
+            if isinstance(cell0, str):
+                nm = normalize_name(cell0)
                 if nm in personen_norm:
                     original = personen[personen_norm.index(nm)]
                     person_rows[original] = i
 
         if not person_rows:
-            st.error("Keine Personen im Sheet gefunden.")
+            st.error("Keine Personen gefunden. Prüfe, ob Namen in Spalte A stehen.")
             st.stop()
 
-        st.write("Gefundene Personenzeilen:")
-        st.json(person_rows)
-
-        # URLAUB ZÄHLEN
+        # Urlaub zählen
         urlaub_genommen = {p: 0 for p in personen}
 
         for person, row_idx in person_rows.items():
@@ -177,10 +155,9 @@ if st.button("🚀 Urlaub 2026 auswerten"):
                         if isinstance(cell, str) and cell.strip().lower() == "u":
                             urlaub_genommen[person] += 1
 
-        # RESULTAT BAUEN
         rows = []
         for p in personen:
-            genommen = urlaub_genommen[p]
+            genommen = urlaub_genommen.get(p, 0)
             kont = default_kontingent
             rest = kont - genommen
             rows.append({
@@ -191,11 +168,9 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             })
 
         df = pd.DataFrame(rows)
-
         st.subheader("📊 Ergebnis – Urlaub 2026")
         st.dataframe(df, use_container_width=True)
 
-        # BALKENDIAGRAMM
         fig = px.bar(
             df,
             x="Person",
@@ -206,11 +181,9 @@ if st.button("🚀 Urlaub 2026 auswerten"):
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
-        # EXPORT
-        csv = df.to_csv(index=False).encode("utf-8")
         st.download_button(
             "CSV herunterladen",
-            csv,
+            df.to_csv(index=False).encode("utf-8"),
             "Urlaub_2026.csv",
             "text/csv"
         )
