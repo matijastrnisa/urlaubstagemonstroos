@@ -3,24 +3,20 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import pandas as pd
 from datetime import datetime
-import calendar
+import plotly.express as px
 
 # ----------------------------------------
 # PAGE SETUP
 # ----------------------------------------
-st.set_page_config(
-    page_title="Urlaubsplaner 2026 – Google Sheets API",
-    layout="centered"
-)
-
+st.set_page_config(page_title="Urlaubsplaner 2026 – Google Sheets API", layout="wide")
 st.title("🏖️ Urlaubsplaner 2026 – Google Sheets API Version (Secrets)")
 
 st.markdown("""
 Diese App:
 - liest **direkt aus Google Sheets (API)**
-- erkennt Urlaubstage anhand von **„u“ in Zellen**
+- erkennt Urlaubstage anhand von **„u“** in Zellen
 - zählt **alle Urlaubstage im Jahr 2026**
-- zeigt **Kontingent, genommene Tage & Resturlaub pro Person**
+- zeigt **Kontingent, genommene Tage & Resturlaub** pro Person
 """)
 
 # ----------------------------------------
@@ -37,19 +33,13 @@ try:
         st.secrets["gcp_service_account"],
         scopes=SCOPES
     )
-
-    service = build(
-        "sheets",
-        "v4",
-        credentials=credentials,
-        cache_discovery=False
-    )
+    service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
 except Exception as e:
     st.error(f"❌ Konnte Service Account nicht laden: {e}")
     st.stop()
 
 # ----------------------------------------
-# USER INPUT
+# INPUTS
 # ----------------------------------------
 st.header("1️⃣ Personen & Kontingent")
 
@@ -57,6 +47,7 @@ names_input = st.text_input(
     "Mitarbeitende (Komma-getrennt)",
     "Sonja, Mareike, Sophia, Ruta, Xenia, Anna"
 )
+personen = [n.strip() for n in names_input.split(",") if n.strip()]
 
 urlaubstage_pro_person = st.number_input(
     "Standard-Urlaubstage 2026 pro Person",
@@ -74,91 +65,153 @@ spreadsheet_id = st.text_input(
 
 sheet_name = st.text_input(
     "Sheet-Tab-Name",
-    value="MP"
+    value="Projektkalender 24/25"
 )
 
 # ----------------------------------------
 # HELPERS
 # ----------------------------------------
-def get_2026_dates():
-    dates = []
-    for month in range(1, 13):
-        for day in range(1, calendar.monthrange(2026, month)[1] + 1):
-            dates.append(datetime(2026, month, day))
-    return dates
+def normalize_name(s: str) -> str:
+    return str(s).split(":")[0].strip().lower()
 
+def pad_rows(values):
+    """Macht alle Zeilen gleich lang, indem sie mit "" aufgefüllt werden."""
+    max_len = max(len(r) for r in values) if values else 0
+    padded = []
+    for r in values:
+        r2 = list(r) + [""] * (max_len - len(r))
+        padded.append(r2)
+    return padded
 
-def read_sheet():
-    result = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=sheet_name
-    ).execute()
-    return result.get("values", [])
+def extract_dates_row(values):
+    """
+    Findet die Zeile mit den meisten Datumswerten (ab Spalte 1).
+    Unterstützt Formate: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY
+    """
+    best_idx = None
+    best_count = -1
+    best_map = {}
 
+    for i, row in enumerate(values):
+        count = 0
+        date_map = {}
+
+        for j, cell in enumerate(row[1:], start=1):
+            d = None
+            if isinstance(cell, str):
+                c = cell.strip()
+                for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+                    try:
+                        d = datetime.strptime(c, fmt).date()
+                        break
+                    except Exception:
+                        pass
+
+            if d is not None:
+                count += 1
+                date_map[j] = d
+
+        if count > best_count:
+            best_count = count
+            best_idx = i
+            best_map = date_map
+
+    return best_idx, best_map
+
+def find_person_rows(values, personen):
+    """
+    Sucht Personen in Spalte 0. Match ist case-insensitive.
+    """
+    target = {normalize_name(p): p for p in personen}
+    found = {}
+    for i, row in enumerate(values):
+        if not row:
+            continue
+        nm = normalize_name(row[0])
+        if nm in target:
+            found[target[nm]] = i
+    return found
 
 # ----------------------------------------
-# MAIN LOGIC
+# MAIN
 # ----------------------------------------
 st.header("3️⃣ Auswertung starten")
 
 if st.button("🚀 Urlaub 2026 auswerten"):
     try:
-        raw_data = read_sheet()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=sheet_name
+        ).execute()
 
-        if not raw_data:
+        values = result.get("values", [])
+        if not values:
             st.error("❌ Sheet ist leer oder nicht lesbar.")
             st.stop()
 
-        header = raw_data[0]
-        rows = raw_data[1:]
+        # 1) Zeilen auf gleiche Länge bringen (wichtig!)
+        values = pad_rows(values)
 
-        df = pd.DataFrame(rows, columns=header)
-        df.fillna("", inplace=True)
+        # 2) Datumszeile automatisch finden
+        date_row_idx, date_map = extract_dates_row(values)
+        if date_row_idx is None or len(date_map) == 0:
+            st.error("❌ Konnte keine Datumszeile finden. Sind Datumswerte als Text vorhanden?")
+            st.stop()
 
-        personen = [n.strip() for n in names_input.split(",") if n.strip()]
-        date_columns = df.columns[1:]  # erste Spalte = Name
+        st.success(f"✅ Datumszeile erkannt (0-basiert): {date_row_idx}")
 
-        results = []
+        # 3) Personenzeilen finden
+        person_rows = find_person_rows(values, personen)
+        if not person_rows:
+            st.error("❌ Keine Personen gefunden. Prüfe, ob Namen in Spalte A stehen.")
+            st.stop()
 
-        for person in personen:
-            if person not in df.iloc[:, 0].values:
-                results.append({
-                    "Person": person,
-                    "Genommene Urlaubstage": 0,
-                    "Urlaubskontingent": urlaubstage_pro_person,
-                    "Resturlaub": urlaubstage_pro_person
-                })
-                continue
+        st.write("Gefundene Personenzeilen:")
+        st.json(person_rows)
 
-            row = df[df.iloc[:, 0] == person].iloc[0]
-            genommen = 0
+        # 4) Urlaub zählen (nur 2026, nur 'u')
+        urlaub_genommen = {p: 0 for p in personen}
 
-            for col in date_columns:
-                cell_value = str(row[col]).strip().lower()
-                if cell_value == "u":
-                    genommen += 1
+        for person, row_idx in person_rows.items():
+            row = values[row_idx]
+            for col_idx, d in date_map.items():
+                if d.year == 2026:
+                    cell = str(row[col_idx]).strip().lower()
+                    if cell == "u":
+                        urlaub_genommen[person] += 1
 
-            results.append({
-                "Person": person,
-                "Genommene Urlaubstage": genommen,
-                "Urlaubskontingent": urlaubstage_pro_person,
-                "Resturlaub": urlaubstage_pro_person - genommen
+        # 5) Ergebnis
+        rows = []
+        for p in personen:
+            genommen = urlaub_genommen.get(p, 0)
+            rows.append({
+                "Person": p,
+                "Kontingent_2026": urlaubstage_pro_person,
+                "Urlaub_2026_genommen": genommen,
+                "Resturlaub_2026": urlaubstage_pro_person - genommen
             })
 
-        result_df = pd.DataFrame(results)
+        df = pd.DataFrame(rows)
 
-        st.success("✅ Auswertung erfolgreich")
-        st.dataframe(result_df, use_container_width=True)
+        st.subheader("📊 Ergebnis – Urlaub 2026")
+        st.dataframe(df, use_container_width=True)
 
-        # ----------------------------------------
-        # DOWNLOAD
-        # ----------------------------------------
+        fig = px.bar(df, x="Person", y="Resturlaub_2026", text="Resturlaub_2026",
+                     title="Resturlaub 2026 pro Person")
+        fig.update_traces(textposition="outside")
+        st.plotly_chart(fig, use_container_width=True)
+
         st.download_button(
-            "⬇️ Ergebnis als Excel herunterladen",
-            data=result_df.to_excel(index=False, engine="openpyxl"),
-            file_name="Urlaubsplan_2026.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            "⬇️ Ergebnis als CSV herunterladen",
+            df.to_csv(index=False).encode("utf-8"),
+            "Urlaub_2026.csv",
+            "text/csv"
         )
+
+        # Optional: Debug-Vorschau (kannst du später rausnehmen)
+        with st.expander("Debug: Rohdaten-Vorschau (erste 15 Zeilen)"):
+            preview_df = pd.DataFrame(values[:15])
+            st.dataframe(preview_df, use_container_width=True)
 
     except Exception as e:
         st.error(f"❌ Fehler beim Lesen des Google Sheets: {e}")
