@@ -2,7 +2,7 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 import plotly.express as px
 
 # ----------------------------------------
@@ -17,6 +17,10 @@ Diese App:
 - erkennt Urlaubstage anhand von **„u“** in Zellen
 - zählt **alle Urlaubstage im Jahr 2026**
 - zeigt **Kontingent, genommene Tage & Resturlaub** pro Person
+
+Wichtig:
+- Diese Version sucht **keine Datumszeile**.
+- Stattdessen gibst du das **Startdatum der ersten Tages-Spalte** an (Spalte B).
 """)
 
 # ----------------------------------------
@@ -25,7 +29,7 @@ Diese App:
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 
 if "gcp_service_account" not in st.secrets:
-    st.error("❌ Service Account fehlt in Streamlit Secrets.")
+    st.error("❌ Service Account fehlt in Streamlit Secrets. (Manage app → Settings → Secrets)")
     st.stop()
 
 try:
@@ -68,6 +72,12 @@ sheet_name = st.text_input(
     value="Projektkalender 24/25"
 )
 
+st.header("2️⃣b Datum-Logik (wichtig)")
+start_date = st.date_input(
+    "Startdatum der ersten Tages-Spalte (Spalte B)",
+    value=date(2025, 1, 1)
+)
+
 # ----------------------------------------
 # HELPERS
 # ----------------------------------------
@@ -83,45 +93,8 @@ def pad_rows(values):
         padded.append(r2)
     return padded
 
-def extract_dates_row(values):
-    """
-    Findet die Zeile mit den meisten Datumswerten (ab Spalte 1).
-    Unterstützt Formate: YYYY-MM-DD, DD.MM.YYYY, DD/MM/YYYY
-    """
-    best_idx = None
-    best_count = -1
-    best_map = {}
-
-    for i, row in enumerate(values):
-        count = 0
-        date_map = {}
-
-        for j, cell in enumerate(row[1:], start=1):
-            d = None
-            if isinstance(cell, str):
-                c = cell.strip()
-                for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
-                    try:
-                        d = datetime.strptime(c, fmt).date()
-                        break
-                    except Exception:
-                        pass
-
-            if d is not None:
-                count += 1
-                date_map[j] = d
-
-        if count > best_count:
-            best_count = count
-            best_idx = i
-            best_map = date_map
-
-    return best_idx, best_map
-
 def find_person_rows(values, personen):
-    """
-    Sucht Personen in Spalte 0. Match ist case-insensitive.
-    """
+    """Sucht Personen in Spalte 0. Match ist case-insensitive."""
     target = {normalize_name(p): p for p in personen}
     found = {}
     for i, row in enumerate(values):
@@ -132,6 +105,14 @@ def find_person_rows(values, personen):
             found[target[nm]] = i
     return found
 
+def date_for_column(col_idx: int) -> date:
+    """
+    col_idx 1 -> start_date (Spalte B)
+    col_idx 2 -> start_date + 1 Tag (Spalte C)
+    usw.
+    """
+    return (pd.Timestamp(start_date) + pd.Timedelta(days=col_idx - 1)).date()
+
 # ----------------------------------------
 # MAIN
 # ----------------------------------------
@@ -139,6 +120,7 @@ st.header("3️⃣ Auswertung starten")
 
 if st.button("🚀 Urlaub 2026 auswerten"):
     try:
+        # 1) Sheet lesen
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=sheet_name
@@ -149,16 +131,8 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             st.error("❌ Sheet ist leer oder nicht lesbar.")
             st.stop()
 
-        # 1) Zeilen auf gleiche Länge bringen (wichtig!)
+        # 2) Zeilen auf gleiche Länge bringen
         values = pad_rows(values)
-
-        # 2) Datumszeile automatisch finden
-        date_row_idx, date_map = extract_dates_row(values)
-        if date_row_idx is None or len(date_map) == 0:
-            st.error("❌ Konnte keine Datumszeile finden. Sind Datumswerte als Text vorhanden?")
-            st.stop()
-
-        st.success(f"✅ Datumszeile erkannt (0-basiert): {date_row_idx}")
 
         # 3) Personenzeilen finden
         person_rows = find_person_rows(values, personen)
@@ -166,21 +140,26 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             st.error("❌ Keine Personen gefunden. Prüfe, ob Namen in Spalte A stehen.")
             st.stop()
 
-        st.write("Gefundene Personenzeilen:")
-        st.json(person_rows)
+        st.success("✅ Personen gefunden.")
+        with st.expander("Debug: Gefundene Personenzeilen"):
+            st.json(person_rows)
 
         # 4) Urlaub zählen (nur 2026, nur 'u')
         urlaub_genommen = {p: 0 for p in personen}
 
         for person, row_idx in person_rows.items():
             row = values[row_idx]
-            for col_idx, d in date_map.items():
+
+            # Spalte 0 = Name, ab Spalte 1 = Tage
+            for col_idx in range(1, len(row)):
+                d = date_for_column(col_idx)
+
                 if d.year == 2026:
                     cell = str(row[col_idx]).strip().lower()
                     if cell == "u":
                         urlaub_genommen[person] += 1
 
-        # 5) Ergebnis
+        # 5) Ergebnis-DataFrame
         rows = []
         for p in personen:
             genommen = urlaub_genommen.get(p, 0)
@@ -196,8 +175,13 @@ if st.button("🚀 Urlaub 2026 auswerten"):
         st.subheader("📊 Ergebnis – Urlaub 2026")
         st.dataframe(df, use_container_width=True)
 
-        fig = px.bar(df, x="Person", y="Resturlaub_2026", text="Resturlaub_2026",
-                     title="Resturlaub 2026 pro Person")
+        fig = px.bar(
+            df,
+            x="Person",
+            y="Resturlaub_2026",
+            text="Resturlaub_2026",
+            title="Resturlaub 2026 pro Person"
+        )
         fig.update_traces(textposition="outside")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -208,10 +192,9 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             "text/csv"
         )
 
-        # Optional: Debug-Vorschau (kannst du später rausnehmen)
-        with st.expander("Debug: Rohdaten-Vorschau (erste 15 Zeilen)"):
-            preview_df = pd.DataFrame(values[:15])
-            st.dataframe(preview_df, use_container_width=True)
+        with st.expander("Debug: Rohdaten-Vorschau (erste 10 Zeilen / 30 Spalten)"):
+            preview = pd.DataFrame(values[:10])
+            st.dataframe(preview.iloc[:, :30], use_container_width=True)
 
     except Exception as e:
         st.error(f"❌ Fehler beim Lesen des Google Sheets: {e}")
