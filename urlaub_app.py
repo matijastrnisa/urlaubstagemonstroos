@@ -2,25 +2,23 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import pandas as pd
-from datetime import datetime, date
+from datetime import date
 import plotly.express as px
 
 # ----------------------------------------
 # PAGE SETUP
 # ----------------------------------------
 st.set_page_config(page_title="Urlaubsplaner 2026 – Google Sheets API", layout="wide")
-st.title("🏖️ Urlaubsplaner 2026 – Google Sheets API Version (Secrets)")
+st.title("🏖️ Urlaubsplaner 2026 – Google Sheets API (Secrets)")
 
 st.markdown("""
 Diese App:
 - liest **direkt aus Google Sheets (API)**
 - erkennt Urlaubstage anhand von **„u“** in Zellen
-- zählt **alle Urlaubstage im Jahr 2026**
-- zeigt **Kontingent, genommene Tage & Resturlaub** pro Person
-
-Zusatz:
-- Wochenenden (Sa/So) werden **nicht gezählt**
-- Berliner Feiertage (2026) werden **nicht gezählt**
+- zählt **Urlaubstage im Jahr 2026**
+- zählt **keine Wochenenden (Sa/So)**
+- zählt **keine Berliner Feiertage 2026**
+- zeigt **Kontingent, genommene Tage & Resturlaub**
 """)
 
 # ----------------------------------------
@@ -72,14 +70,14 @@ sheet_name = st.text_input(
     value="Projektkalender 24/25"
 )
 
-st.header("2️⃣b Datum-Logik (wichtig)")
-start_date = st.date_input(
-    "Startdatum der ersten Tages-Spalte (Spalte B)",
-    value=date(2025, 1, 1)
-)
+st.header("3️⃣ Spalten-/Datum-Referenz (entscheidend)")
+st.caption("Du hast gesagt: **01.01.2026 ist Spalte ABK**. Das nutzen wir als Referenz.")
+
+ref_col_letters = st.text_input("Referenz-Spalte (z.B. ABK)", value="ABK")
+ref_date = st.date_input("Referenz-Datum für diese Spalte", value=date(2026, 1, 1))
 
 # ----------------------------------------
-# HOLIDAYS (BERLIN) – 2026
+# BERLIN HOLIDAYS 2026
 # ----------------------------------------
 def easter_sunday(year: int) -> date:
     # Gregorian Easter (Anonymous algorithm)
@@ -99,7 +97,7 @@ def easter_sunday(year: int) -> date:
     day = ((h + l - 7 * m + 114) % 31) + 1
     return date(year, month, day)
 
-def berlin_holidays_2026() -> set[date]:
+def berlin_holidays_2026() -> set:
     y = 2026
     easter = easter_sunday(y)
     good_friday = easter + pd.Timedelta(days=-2)
@@ -107,14 +105,15 @@ def berlin_holidays_2026() -> set[date]:
     ascension = easter + pd.Timedelta(days=39)
     whit_monday = easter + pd.Timedelta(days=50)
 
+    # Berlin-specific: Frauentag (Mar 8) + Reformationstag (Oct 31)
     return {
         date(y, 1, 1),   # Neujahr
-        date(y, 3, 8),   # Internationaler Frauentag (Berlin)
-        good_friday,     # Karfreitag
-        easter_monday,   # Ostermontag
+        date(y, 3, 8),   # Frauentag (Berlin)
+        good_friday.date(),     # Karfreitag
+        easter_monday.date(),   # Ostermontag
         date(y, 5, 1),   # Tag der Arbeit
-        ascension,       # Christi Himmelfahrt
-        whit_monday,     # Pfingstmontag
+        ascension.date(),       # Christi Himmelfahrt
+        whit_monday.date(),     # Pfingstmontag
         date(y, 10, 3),  # Tag der Deutschen Einheit
         date(y, 10, 31), # Reformationstag (Berlin)
         date(y, 12, 25), # 1. Weihnachtstag
@@ -138,16 +137,10 @@ def normalize_name(s: str) -> str:
     return str(s).split(":")[0].strip().lower()
 
 def pad_rows(values):
-    """Macht alle Zeilen gleich lang, indem sie mit "" aufgefüllt werden."""
     max_len = max(len(r) for r in values) if values else 0
-    padded = []
-    for r in values:
-        r2 = list(r) + [""] * (max_len - len(r))
-        padded.append(r2)
-    return padded
+    return [list(r) + [""] * (max_len - len(r)) for r in values]
 
 def find_person_rows(values, personen):
-    """Sucht Personen in Spalte 0. Match ist case-insensitive."""
     target = {normalize_name(p): p for p in personen}
     found = {}
     for i, row in enumerate(values):
@@ -158,22 +151,35 @@ def find_person_rows(values, personen):
             found[target[nm]] = i
     return found
 
-def date_for_column(col_idx: int) -> date:
+def col_to_index(col_letters: str) -> int:
     """
-    col_idx 1 -> start_date (Spalte B)
-    col_idx 2 -> start_date + 1 Tag (Spalte C)
-    usw.
+    Excel/Sheets Column letters -> 1-based index:
+    A=1, B=2, ..., Z=26, AA=27, ...
     """
-    return (pd.Timestamp(start_date) + pd.Timedelta(days=col_idx - 1)).date()
+    col_letters = col_letters.strip().upper()
+    n = 0
+    for ch in col_letters:
+        if not ("A" <= ch <= "Z"):
+            raise ValueError(f"Ungültige Spalte: {col_letters}")
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+def date_for_column(col_idx_1based: int, ref_col_idx_1based: int, ref_date_val: date) -> date:
+    """
+    Mappt jede Spalte auf ein Datum, basierend auf Referenz.
+    Annahme: jede Spalte entspricht +1 Kalendertag.
+    """
+    delta_days = col_idx_1based - ref_col_idx_1based
+    return (pd.Timestamp(ref_date_val) + pd.Timedelta(days=delta_days)).date()
 
 # ----------------------------------------
 # MAIN
 # ----------------------------------------
-st.header("3️⃣ Auswertung starten")
+st.header("4️⃣ Auswertung starten")
 
 if st.button("🚀 Urlaub 2026 auswerten"):
     try:
-        # 1) Sheet lesen
+        # sheet lesen
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=sheet_name
@@ -184,35 +190,43 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             st.error("❌ Sheet ist leer oder nicht lesbar.")
             st.stop()
 
-        # 2) Zeilen auf gleiche Länge bringen
         values = pad_rows(values)
 
-        # 3) Personenzeilen finden
+        # personen finden
         person_rows = find_person_rows(values, personen)
         if not person_rows:
             st.error("❌ Keine Personen gefunden. Prüfe, ob Namen in Spalte A stehen.")
             st.stop()
 
-        st.success("✅ Personen gefunden.")
-        with st.expander("Debug: Gefundene Personenzeilen"):
-            st.json(person_rows)
+        ref_col_idx = col_to_index(ref_col_letters)  # 1-based
 
-        # 4) Urlaub zählen (nur 2026, nur 'u', nur Arbeitstage in Berlin)
+        # Urlaub zählen
         urlaub_genommen = {p: 0 for p in personen}
+        ignored_weekend_or_holiday = {p: 0 for p in personen}  # optional debug
 
         for person, row_idx in person_rows.items():
             row = values[row_idx]
 
-            # Spalte 0 = Name, ab Spalte 1 = Tage
-            for col_idx in range(1, len(row)):
-                d = date_for_column(col_idx)
+            # Achtung:
+            # values() liefert 0-based Listenindex:
+            # list index 0 = Spalte A (Name)
+            # list index 1 = Spalte B
+            # -> col_idx_1based = list_index + 1
+            for list_idx in range(1, len(row)):  # ab Spalte B
+                col_idx_1based = list_idx + 1
+                d = date_for_column(col_idx_1based, ref_col_idx, ref_date)
 
-                if d.year == 2026 and is_workday_berlin_2026(d):
-                    cell = str(row[col_idx]).strip().lower()
-                    if cell == "u":
+                if d.year != 2026:
+                    continue
+
+                cell = str(row[list_idx]).strip().lower()
+                if cell == "u":
+                    if is_workday_berlin_2026(d):
                         urlaub_genommen[person] += 1
+                    else:
+                        ignored_weekend_or_holiday[person] += 1
 
-        # 5) Ergebnis-DataFrame
+        # Ergebnis
         rows = []
         for p in personen:
             genommen = urlaub_genommen.get(p, 0)
@@ -220,7 +234,8 @@ if st.button("🚀 Urlaub 2026 auswerten"):
                 "Person": p,
                 "Kontingent_2026": urlaubstage_pro_person,
                 "Urlaub_2026_genommen": genommen,
-                "Resturlaub_2026": urlaubstage_pro_person - genommen
+                "Resturlaub_2026": urlaubstage_pro_person - genommen,
+                "u_ignoriert_(Wochenende/Feiertag)": ignored_weekend_or_holiday.get(p, 0)
             })
 
         df = pd.DataFrame(rows)
@@ -245,5 +260,19 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             "text/csv"
         )
 
+        with st.expander("Debug: Referenz-Check (erste 10 Tage um den 01.01.2026)"):
+            # Zeige, ob die Spalten-Map sinnvoll ist
+            ref = ref_col_idx
+            debug = []
+            for delta in range(-3, 7):
+                col_num = ref + delta
+                d = date_for_column(col_num, ref_col_idx, ref_date)
+                debug.append({
+                    "Spalte (Index 1-based)": col_num,
+                    "Datum": d.isoformat(),
+                    "Ist Arbeitstag?": is_workday_berlin_2026(d) if d.year == 2026 else None
+                })
+            st.dataframe(pd.DataFrame(debug), use_container_width=True)
+
     except Exception as e:
-        st.error(f"❌ Fehler beim Lesen des Google Sheets: {e}")
+        st.error(f"❌ Fehler: {e}")
