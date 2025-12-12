@@ -18,9 +18,9 @@ Diese App:
 - zählt **alle Urlaubstage im Jahr 2026**
 - zeigt **Kontingent, genommene Tage & Resturlaub** pro Person
 
-Wichtig:
-- Diese Version sucht **keine Datumszeile**.
-- Stattdessen gibst du das **Startdatum der ersten Tages-Spalte** an (Spalte B).
+Zusatz:
+- Wochenenden (Sa/So) werden **nicht gezählt**
+- Berliner Feiertage (2026) werden **nicht gezählt**
 """)
 
 # ----------------------------------------
@@ -77,6 +77,59 @@ start_date = st.date_input(
     "Startdatum der ersten Tages-Spalte (Spalte B)",
     value=date(2025, 1, 1)
 )
+
+# ----------------------------------------
+# HOLIDAYS (BERLIN) – 2026
+# ----------------------------------------
+def easter_sunday(year: int) -> date:
+    # Gregorian Easter (Anonymous algorithm)
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+def berlin_holidays_2026() -> set[date]:
+    y = 2026
+    easter = easter_sunday(y)
+    good_friday = easter + pd.Timedelta(days=-2)
+    easter_monday = easter + pd.Timedelta(days=1)
+    ascension = easter + pd.Timedelta(days=39)
+    whit_monday = easter + pd.Timedelta(days=50)
+
+    return {
+        date(y, 1, 1),   # Neujahr
+        date(y, 3, 8),   # Internationaler Frauentag (Berlin)
+        good_friday,     # Karfreitag
+        easter_monday,   # Ostermontag
+        date(y, 5, 1),   # Tag der Arbeit
+        ascension,       # Christi Himmelfahrt
+        whit_monday,     # Pfingstmontag
+        date(y, 10, 3),  # Tag der Deutschen Einheit
+        date(y, 10, 31), # Reformationstag (Berlin)
+        date(y, 12, 25), # 1. Weihnachtstag
+        date(y, 12, 26), # 2. Weihnachtstag
+    }
+
+BERLIN_HOLIDAYS_2026 = berlin_holidays_2026()
+
+def is_workday_berlin_2026(d: date) -> bool:
+    # Mo=0 .. So=6
+    if d.weekday() >= 5:
+        return False
+    if d in BERLIN_HOLIDAYS_2026:
+        return False
+    return True
 
 # ----------------------------------------
 # HELPERS
@@ -144,7 +197,7 @@ if st.button("🚀 Urlaub 2026 auswerten"):
         with st.expander("Debug: Gefundene Personenzeilen"):
             st.json(person_rows)
 
-        # 4) Urlaub zählen (nur 2026, nur 'u')
+        # 4) Urlaub zählen (nur 2026, nur 'u', nur Arbeitstage in Berlin)
         urlaub_genommen = {p: 0 for p in personen}
 
         for person, row_idx in person_rows.items():
@@ -154,7 +207,7 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             for col_idx in range(1, len(row)):
                 d = date_for_column(col_idx)
 
-                if d.year == 2026:
+                if d.year == 2026 and is_workday_berlin_2026(d):
                     cell = str(row[col_idx]).strip().lower()
                     if cell == "u":
                         urlaub_genommen[person] += 1
@@ -172,7 +225,7 @@ if st.button("🚀 Urlaub 2026 auswerten"):
 
         df = pd.DataFrame(rows)
 
-        st.subheader("📊 Ergebnis – Urlaub 2026")
+        st.subheader("📊 Ergebnis – Urlaub 2026 (ohne Wochenenden/Feiertage)")
         st.dataframe(df, use_container_width=True)
 
         fig = px.bar(
@@ -191,10 +244,6 @@ if st.button("🚀 Urlaub 2026 auswerten"):
             "Urlaub_2026.csv",
             "text/csv"
         )
-
-        with st.expander("Debug: Rohdaten-Vorschau (erste 10 Zeilen / 30 Spalten)"):
-            preview = pd.DataFrame(values[:10])
-            st.dataframe(preview.iloc[:, :30], use_container_width=True)
 
     except Exception as e:
         st.error(f"❌ Fehler beim Lesen des Google Sheets: {e}")
